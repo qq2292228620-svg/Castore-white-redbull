@@ -1,0 +1,50 @@
+name: Castore XL Stock Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: '忽略库存状态，发送一条 Bark 测试推送'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: castore-xl-stock-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run Castore XL stock monitor
+        env:
+          BARK_URL: ${{ secrets.BARK_URL }}
+        run: |
+          if [ "${{ inputs.test_mode }}" = "true" ]; then
+            python monitor.py --test
+          else
+            python monitor.py
+          fi
