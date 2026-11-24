@@ -91,7 +91,28 @@ class TestShopifyApiFallback:
         with pytest.raises(monitor.ApiFallbackError):
             monitor.check_stock_via_shopify_api(session=fake_session)
 
-    def test_check_stock_falls_back_to_playwright(self) -> None:
+    def test_check_stock_prefers_reader_when_direct_blocked(self) -> None:
+        """直连被 Cloudflare 拦截时应先走转发通道，而不是直接上 Playwright。"""
+        expected = monitor.StockCheckResult(
+            available=True, source="reader", detail="XL available=True"
+        )
+        with (
+            patch.object(
+                monitor,
+                "check_stock_via_shopify_api",
+                side_effect=monitor.ApiFallbackError("403"),
+            ),
+            patch.object(
+                monitor, "check_stock_via_reader", return_value=expected
+            ) as mock_reader,
+            patch.object(monitor, "check_stock_via_playwright") as mock_pw,
+        ):
+            result = monitor.check_stock()
+            assert result == expected
+            mock_reader.assert_called_once()
+            mock_pw.assert_not_called()
+
+    def test_check_stock_falls_back_to_playwright_when_reader_fails(self) -> None:
         expected = monitor.StockCheckResult(
             available=False, source="playwright", detail="XL disabled"
         )
@@ -102,12 +123,157 @@ class TestShopifyApiFallback:
                 side_effect=monitor.ApiFallbackError("403"),
             ),
             patch.object(
+                monitor,
+                "check_stock_via_reader",
+                side_effect=monitor.ApiFallbackError("429"),
+            ),
+            patch.object(
                 monitor, "check_stock_via_playwright", return_value=expected
             ) as mock_pw,
         ):
             result = monitor.check_stock()
             assert result == expected
             mock_pw.assert_called_once()
+
+    def test_check_stock_raises_when_all_channels_fail(self) -> None:
+        with (
+            patch.object(
+                monitor,
+                "check_stock_via_shopify_api",
+                side_effect=monitor.ApiFallbackError("403"),
+            ),
+            patch.object(
+                monitor,
+                "check_stock_via_reader",
+                side_effect=monitor.ApiFallbackError("429"),
+            ),
+            patch.object(
+                monitor,
+                "check_stock_via_playwright",
+                side_effect=monitor.CloudflareBlockedError("cf"),
+            ),
+        ):
+            with pytest.raises(monitor.CloudflareBlockedError) as excinfo:
+                monitor.check_stock()
+        message = str(excinfo.value)
+        assert "全部通道" in message
+        assert "直连" in message and "转发" in message and "playwright" in message
+
+
+class TestReaderChannel:
+    """r.jina.ai 转发通道的解析、验证页识别与重试。"""
+
+    GOOD_XL_OUT = (
+        '{"variants":[{"id":2,"title":"XL","option1":"XL","available":false},'
+        '{"id":3,"title":"4XL","option1":"4XL","available":true}]}'
+    )
+
+    # 真实抓到的转发层响应：Cloudflare 验证页被渲染成 markdown，httpStatus 仍是 200
+    CHALLENGE_MARKDOWN = (
+        "![Image 1: Icon for castore.com](https://castore.com/favicon.ico)\n\n"
+        "## castore.com\n\n## Performing security verification\n\n"
+        "This website uses a security service to protect against malicious bots. "
+        "This page is displayed while the website verifies you are not a bot."
+    )
+
+    @staticmethod
+    def _envelope(content: str, http_status: int = 200, code: int = 200) -> MagicMock:
+        fake_resp = MagicMock(spec=requests.Response)
+        fake_resp.status_code = 200
+        fake_resp.json.return_value = {
+            "code": code,
+            "status": 20000 if code == 200 else 40000,
+            "data": {"content": content, "httpStatus": http_status},
+        }
+        return fake_resp
+
+    def test_reader_parses_available_xl(self) -> None:
+        content = (
+            '{"variants":['
+            '{"id":1,"title":"L","option1":"L","available":true},'
+            '{"id":2,"title":"XL","option1":"XL","available":true},'
+            '{"id":3,"title":"4XL","option1":"4XL","available":true}]}'
+        )
+        session = MagicMock()
+        session.get.return_value = self._envelope(content)
+        result = monitor.check_stock_via_reader(session=session)
+        assert result.available is True
+        assert result.source == "reader"
+
+    def test_reader_ignores_4xl_in_stock(self) -> None:
+        session = MagicMock()
+        session.get.return_value = self._envelope(self.GOOD_XL_OUT)
+        result = monitor.check_stock_via_reader(session=session)
+        assert result.available is False
+
+    def test_reader_uses_cache_buster_and_no_cache_header(self) -> None:
+        session = MagicMock()
+        session.get.return_value = self._envelope(self.GOOD_XL_OUT)
+        monitor.check_stock_via_reader(api_url="https://example.com/p.js", session=session)
+
+        called_url = session.get.call_args.args[0]
+        kwargs = session.get.call_args.kwargs
+        assert called_url.startswith("https://r.jina.ai/https://example.com/p.js?v=")
+        assert kwargs["headers"]["X-Cache-Tolerance"] == "0"
+
+    def test_reader_detects_markdown_challenge_page(self) -> None:
+        """转发出口被拦时返回的是 markdown 验证页且 httpStatus=200，必须识别为可重试故障。"""
+        session = MagicMock()
+        session.get.return_value = self._envelope(self.CHALLENGE_MARKDOWN)
+        with pytest.raises(monitor._ReaderTransientError):
+            monitor._reader_attempt(
+                monitor.SHOPIFY_API_URL, monitor.TARGET_SIZE, 30, session
+            )
+
+    def test_reader_retries_on_transient_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(monitor.time, "sleep", lambda *_: None)
+        session = MagicMock()
+        session.get.side_effect = [
+            self._envelope(self.CHALLENGE_MARKDOWN),
+            self._envelope(self.GOOD_XL_OUT),
+        ]
+        result = monitor.check_stock_via_reader(session=session, max_attempts=3)
+        assert result.available is False
+        assert session.get.call_count == 2
+
+    def test_reader_gives_up_after_max_attempts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(monitor.time, "sleep", lambda *_: None)
+        session = MagicMock()
+        session.get.return_value = self._envelope(self.CHALLENGE_MARKDOWN)
+        with pytest.raises(monitor.ApiFallbackError) as excinfo:
+            monitor.check_stock_via_reader(session=session, max_attempts=3)
+        assert session.get.call_count == 3
+        assert "重试 3 次" in str(excinfo.value)
+
+    def test_reader_rate_limited_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(monitor.time, "sleep", lambda *_: None)
+        limited = MagicMock(spec=requests.Response)
+        limited.status_code = 429
+        session = MagicMock()
+        session.get.side_effect = [limited, self._envelope(self.GOOD_XL_OUT)]
+        result = monitor.check_stock_via_reader(session=session, max_attempts=3)
+        assert result.available is False
+
+    def test_reader_upstream_403(self) -> None:
+        session = MagicMock()
+        session.get.return_value = self._envelope("", http_status=403)
+        with pytest.raises(monitor.ApiFallbackError):
+            monitor.check_stock_via_reader(session=session, max_attempts=1)
+
+    def test_reader_missing_xl_raises_without_retry(self) -> None:
+        """尺码缺失是确定性结果，不应浪费重试次数。"""
+        content = '{"variants":[{"id":1,"title":"2XL","option1":"2XL","available":true}]}'
+        session = MagicMock()
+        session.get.return_value = self._envelope(content)
+        with pytest.raises(monitor.ApiFallbackError):
+            monitor.check_stock_via_reader(session=session, max_attempts=3)
+        assert session.get.call_count == 1
 
 
 class TestDomEvaluation:

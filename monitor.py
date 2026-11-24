@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Castore Oracle Red Bull Racing Unisex Motor Jacket (XL) 库存监控脚本。
 
-优先请求 Shopify 商品 .js 数据接口；若遇到 403、超时或 Cloudflare 拦截，
-自动降级使用 Playwright（无头 Chromium）访问商品页检测 XL 尺码按钮状态。
+三级检测链路（任一成功即返回）：
+  1. 直连 Shopify 商品 .js 数据接口（干净 IP / 本地 / 配代理时最快）
+  2. r.jina.ai 转发通道（数据中心 IP 被 Cloudflare 拦截时使用，实测 ~2.5s）
+  3. Playwright（无头 Chromium）打开商品页检测 XL 尺码按钮状态（最后兜底）
+
 仅在检测到 XL 码有货（或传入 --test 参数）时通过 Bark GET 接口推送通知。
 """
 
@@ -11,9 +14,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import os
 import re
 import sys
+import time
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -42,6 +47,17 @@ USER_AGENT = (
 REQUEST_TIMEOUT_SECONDS = 15
 PLAYWRIGHT_TIMEOUT_MS = 30_000
 
+# r.jina.ai 转发通道：从服务端自家出口抓取，绕开本机 IP 信誉问题。
+# castore.com 整站受 Cloudflare Managed Challenge 保护（连 robots.txt 都拦），
+# 数据中心 IP（GitHub Actions / Azure）即使伪装完整 Chrome TLS 指纹仍返回 403，
+# 因此该通道是 Actions 环境下唯一稳定可用的取数方式。
+READER_ENDPOINT = "https://r.jina.ai/"
+READER_TIMEOUT_SECONDS = 90
+# 转发服务的出口 IP 偶尔也会被目标站点临时拦截（实测约 1/8 概率，
+# 返回的是渲染后的验证页但 httpStatus 仍报 200），因此必须重试。
+READER_MAX_ATTEMPTS = 3
+READER_RETRY_BACKOFF_SECONDS = 2.0
+
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -62,6 +78,16 @@ CHALLENGE_HTML_MARKERS = (
     "challenge-running",
     "_cf_chl_opt",
     "verify you are human",
+)
+
+# 转发层返回"人机验证页"时的特征词（含被 Cloudflare 渲染成 markdown 后的措辞）。
+# 这类响应 body 不含 JSON，且 httpStatus 仍可能报 200，必须靠正文特征识别。
+READER_CHALLENGE_MARKERS = CHALLENGE_TITLE_MARKERS + (
+    "performing security verification",
+    "verifies you are not a bot",
+    "enable javascript and cookies to continue",
+    "checking your browser",
+    "security service to protect against malicious bots",
 )
 
 UNAVAILABLE_CLASS_TOKENS = (
@@ -121,6 +147,14 @@ def now_str() -> str:
 def log(message: str) -> None:
     """打印带时间戳的日志。"""
     print(f"[{now_str()}] {message}", flush=True)
+
+
+def proxy_config() -> dict[str, str] | None:
+    """从环境变量 SHOPIFY_PROXY 读取可选代理（配了住宅代理时直连通道即可恢复使用）。"""
+    proxy = os.environ.get("SHOPIFY_PROXY", "").strip()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
 
 
 def normalize_size_text(value: Any) -> str:
@@ -198,7 +232,12 @@ def check_stock_via_shopify_api(
     """优先请求 Shopify 商品 .js 接口检测目标尺码库存。"""
     client = session or requests
     try:
-        response = client.get(api_url, headers=DEFAULT_HEADERS, timeout=timeout)
+        response = client.get(
+            api_url,
+            headers=DEFAULT_HEADERS,
+            timeout=timeout,
+            proxies=proxy_config(),
+        )
     except requests.Timeout as exc:
         raise ApiFallbackError(f"Shopify 接口请求超时（>{timeout}s）") from exc
     except requests.RequestException as exc:
@@ -226,6 +265,132 @@ def check_stock_via_shopify_api(
         raise ApiFallbackError("Shopify 接口 JSON 根节点不是对象")
 
     return parse_shopify_variants(payload, target_size=target_size)
+
+
+class _ReaderTransientError(ApiFallbackError):
+    """转发通道的瞬时故障（可重试），例如出口 IP 被临时拦截、限流、内容为空。"""
+
+
+def _reader_attempt(
+    api_url: str,
+    target_size: str,
+    timeout: int,
+    session: requests.Session | None,
+) -> StockCheckResult:
+    """转发通道的单次尝试。瞬时故障抛 _ReaderTransientError，其余抛 ApiFallbackError。"""
+    separator = "&" if "?" in api_url else "?"
+    busted_url = f"{api_url}{separator}v={int(time.time() * 1000)}"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+        "X-Cache-Tolerance": "0",
+    }
+    if api_key := os.environ.get("JINA_API_KEY", "").strip():
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    client = session or requests
+    try:
+        response = client.get(
+            READER_ENDPOINT + busted_url, headers=headers, timeout=timeout
+        )
+    except requests.Timeout as exc:
+        raise _ReaderTransientError(f"转发通道超时（>{timeout}s）") from exc
+    except requests.RequestException as exc:
+        raise _ReaderTransientError(f"转发通道网络异常: {exc}") from exc
+
+    if response.status_code == 429:
+        raise _ReaderTransientError(
+            "转发通道被限流（HTTP 429），可配置 JINA_API_KEY 提高配额"
+        )
+    if response.status_code >= 500:
+        raise _ReaderTransientError(f"转发通道服务端错误 HTTP {response.status_code}")
+    if response.status_code != 200:
+        raise ApiFallbackError(f"转发通道返回 HTTP {response.status_code}")
+
+    try:
+        envelope = response.json()
+    except ValueError as exc:
+        raise _ReaderTransientError("转发通道响应不是有效 JSON") from exc
+
+    if not isinstance(envelope, dict):
+        raise ApiFallbackError("转发通道响应根节点不是对象")
+    if envelope.get("code") != 200:
+        raise _ReaderTransientError(f"转发通道上游错误: {str(envelope)[:200]}")
+
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        raise ApiFallbackError("转发通道响应缺少 data 字段")
+
+    upstream_status = data.get("httpStatus")
+    if upstream_status not in (None, 200):
+        raise _ReaderTransientError(f"转发通道上游站点返回 HTTP {upstream_status}")
+
+    content = str(data.get("content") or "").strip()
+    if not content:
+        raise _ReaderTransientError("转发通道返回空内容")
+
+    # 转发层可能把验证页渲染成 markdown 却仍报 httpStatus=200，
+    # 且正文不含 JSON —— 仅靠状态码无法识别，必须看正文特征。
+    if not content.startswith("{"):
+        head_lower = content[:2048].lower()
+        if content.startswith("<") or any(
+            marker in head_lower for marker in READER_CHALLENGE_MARKERS
+        ):
+            raise _ReaderTransientError("转发出口被 Cloudflare 临时拦截（拿到人机验证页）")
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end <= start:
+            raise _ReaderTransientError(f"转发通道返回非商品数据: {content[:120]!r}")
+        content = content[start : end + 1]
+
+    try:
+        payload = json.loads(content)
+    except ValueError as exc:
+        raise _ReaderTransientError(f"转发通道商品 JSON 解析失败: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ApiFallbackError("转发通道商品 JSON 根节点不是对象")
+
+    # 尺码缺失属于确定性结果，不重试，直接上抛
+    parsed = parse_shopify_variants(payload, target_size=target_size)
+    return StockCheckResult(
+        available=parsed.available,
+        source="reader",
+        detail=f"经 r.jina.ai 转发取数；{parsed.detail}",
+    )
+
+
+def check_stock_via_reader(
+    api_url: str = SHOPIFY_API_URL,
+    target_size: str = TARGET_SIZE,
+    timeout: int = READER_TIMEOUT_SECONDS,
+    session: requests.Session | None = None,
+    max_attempts: int = READER_MAX_ATTEMPTS,
+) -> StockCheckResult:
+    """通过 r.jina.ai 转发通道抓取 Shopify 商品 .js 数据并判断库存。
+
+    关键点：
+      * 带毫秒时间戳 cache-buster，并置 X-Cache-Tolerance: 0 —— 库存监控绝不能读缓存，
+        否则补货后可能拿到几分钟前的旧数据而漏报。
+      * 转发层可能以 HTTP 200 返回"上游失败/人机验证页"的正文，必须逐层校验
+        code / httpStatus / 正文是否为商品 JSON，不能只看状态码。
+      * 该故障是瞬时的（实测约 1/8 概率），必须重试；单次失败就放弃会导致漏报。
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _reader_attempt(api_url, target_size, timeout, session)
+        except _ReaderTransientError as exc:
+            last_error = exc
+            if attempt < max_attempts:
+                log(f"转发通道第 {attempt}/{max_attempts} 次尝试失败（{exc}），重试中...")
+                time.sleep(READER_RETRY_BACKOFF_SECONDS * attempt)
+            else:
+                log(f"转发通道连续 {max_attempts} 次失败（{exc}）")
+
+    raise ApiFallbackError(f"转发通道重试 {max_attempts} 次仍失败: {last_error}")
+
 
 
 def _is_candidate_unavailable(item: dict[str, Any]) -> bool:
@@ -571,12 +736,31 @@ def check_stock_via_playwright(
 
 
 def check_stock() -> StockCheckResult:
-    """执行完整库存检测：先 Shopify .js 接口，失败或被拦截时自动切换 Playwright。"""
+    """执行完整库存检测：直连 Shopify 接口 → r.jina.ai 转发 → Playwright 兜底。"""
+    reasons: list[str] = []
+
     try:
         return check_stock_via_shopify_api()
     except ApiFallbackError as exc:
-        log(f"Shopify 接口检测受阻（{exc}），自动切换 Playwright（无头 Chromium）访问商品页...")
+        reasons.append(f"直连: {exc}")
+        log(f"直连 Shopify 接口受阻（{exc}），切换到 r.jina.ai 转发通道...")
+
+    try:
+        return check_stock_via_reader()
+    except ApiFallbackError as exc:
+        reasons.append(f"转发: {exc}")
+        log(f"转发通道不可用（{exc}），最后尝试 Playwright（无头 Chromium）...")
+
+    try:
         return check_stock_via_playwright()
+    except CloudflareBlockedError as exc:
+        reasons.append(f"playwright: {exc}")
+        raise CloudflareBlockedError(
+            "全部通道均被 Cloudflare 拦截 → " + " | ".join(reasons)
+        ) from exc
+    except StockCheckError as exc:
+        reasons.append(f"playwright: {exc}")
+        raise StockCheckError("全部通道均检测失败 → " + " | ".join(reasons)) from exc
 
 
 def build_bark_push_url(
@@ -665,8 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     except CloudflareBlockedError as exc:
         log(f"检测受阻：{exc}")
         log(
-            "说明：目标站点当前对自动化请求返回 Cloudflare 反爬验证（CF-Mitigated: challenge），"
-            "脚本遵循安全规范未尝试绕过验证码。"
+            "排查建议：① 检查 r.jina.ai 是否可达（免费额度约 20 次/分钟，超限会返回 429）；"
+            "② 配置 JINA_API_KEY 提高配额；③ 配置 SHOPIFY_PROXY 住宅代理后可走直连通道。"
         )
         return 1
     except StockCheckError as exc:

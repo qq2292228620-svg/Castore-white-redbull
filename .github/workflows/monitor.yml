@@ -36,12 +36,17 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
+      # Playwright 仅作为最后兜底（前两条 HTTP 通道都失效时才需要），
+      # 默认跳过安装以节省每次约 90 秒的运行时间。
+      - name: Install Playwright Chromium (optional)
+        if: vars.ENABLE_PLAYWRIGHT == 'true'
         run: python -m playwright install --with-deps chromium
 
       - name: Run Castore XL stock monitor
         env:
           BARK_URL: ${{ secrets.BARK_URL }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          SHOPIFY_PROXY: ${{ secrets.SHOPIFY_PROXY }}
         run: |
           if [ "${{ inputs.test_mode }}" = "true" ]; then
             python monitor.py --test
