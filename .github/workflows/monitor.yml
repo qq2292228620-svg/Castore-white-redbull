@@ -39,6 +39,22 @@ jobs:
 
       # Playwright 仅作为最后兜底（前两条 HTTP 通道都失效时才需要），
       # 默认跳过安装以节省每次约 90 秒的运行时间。
+      # 注意：一旦启用，必须同时把仓库变量 ENABLE_PLAYWRIGHT 设为 true，
+      # 安装步骤与下方 PLAYWRIGHT_FALLBACK 都依赖它，否则装了也用不上。
+      - name: Resolve Playwright version
+        id: pw
+        if: vars.ENABLE_PLAYWRIGHT == 'true'
+        run: echo "version=$(python -c 'import playwright; print(playwright.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        if: vars.ENABLE_PLAYWRIGHT == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # 缓存键必须绑定 Playwright 版本：版本升级后 chromium 构建号会变（如 1255），
+          # 复用旧缓存会导致 Executable doesn't exist。
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
       - name: Install Playwright Chromium (optional)
         if: vars.ENABLE_PLAYWRIGHT == 'true'
         run: python -m playwright install --with-deps chromium
@@ -48,9 +64,22 @@ jobs:
           BARK_URL: ${{ secrets.BARK_URL }}
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
           SHOPIFY_PROXY: ${{ secrets.SHOPIFY_PROXY }}
+          # CI 机房 IP 访问 castore.com 必被 Cloudflare 托管挑战拦截，
+          # Playwright 兜底在 Actions 上从未成功过；而浏览器未安装时它会抛
+          # playwright._impl._errors.Error 直接崩栈，把真正的原因（两条 HTTP
+          # 通道都失败）盖掉。这里默认关闭兜底，让失败原因清晰可控。
+          PLAYWRIGHT_FALLBACK: ${{ vars.ENABLE_PLAYWRIGHT == 'true' && 'true' || 'false' }}
         run: |
           if [ "${{ inputs.test_mode }}" = "true" ]; then
             python monitor.py --test
           else
             python monitor.py
           fi
+
+      - name: Diagnose on failure
+        if: failure()
+        run: |
+          echo "--- playwright package ---"
+          python -m pip show playwright 2>/dev/null | head -3 || echo "playwright not installed"
+          echo "--- browser cache ---"
+          ls -l ~/.cache/ms-playwright 2>/dev/null || echo "no browser cache"

@@ -47,6 +47,13 @@ USER_AGENT = (
 REQUEST_TIMEOUT_SECONDS = 15
 PLAYWRIGHT_TIMEOUT_MS = 30_000
 
+# Playwright 兜底开关（默认启用，便于本地 / 住宅 IP 环境使用）。
+# GitHub Actions 的机房 IP 访问 castore.com 必定触发 Cloudflare 托管挑战，
+# 该通道在 CI 中从未成功过，只会额外烧掉约 90 秒安装浏览器的时间，
+# 且在浏览器未安装时直接抛未捕获异常把整个 run 打红。CI 中请设为 false。
+PLAYWRIGHT_FALLBACK_ENV = "PLAYWRIGHT_FALLBACK"
+PLAYWRIGHT_FALLBACK_DISABLED_VALUES = ("0", "false", "off", "no", "disabled")
+
 # r.jina.ai 转发通道：从服务端自家出口抓取，绕开本机 IP 信誉问题。
 # castore.com 整站受 Cloudflare Managed Challenge 保护（连 robots.txt 都拦），
 # 数据中心 IP（GitHub Actions / Azure）即使伪装完整 Chrome TLS 指纹仍返回 403，
@@ -155,6 +162,12 @@ def proxy_config() -> dict[str, str] | None:
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}
+
+
+def playwright_fallback_enabled() -> bool:
+    """判断是否允许走 Playwright 兜底通道（默认启用，可用环境变量关闭）。"""
+    flag = os.environ.get(PLAYWRIGHT_FALLBACK_ENV, "").strip().lower()
+    return flag not in PLAYWRIGHT_FALLBACK_DISABLED_VALUES
 
 
 def normalize_size_text(value: Any) -> str:
@@ -526,7 +539,17 @@ def check_stock_via_playwright(
         ) from exc
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:
+            # 浏览器未安装 / 版本不匹配（Executable doesn't exist）时，
+            # playwright 抛的是内部错误类型而非 StockCheckError，
+            # 若不转换会导致整个 run 直接崩栈，掩盖真正原因。
+            raise StockCheckError(
+                "Playwright 浏览器未安装或启动失败，请先执行 "
+                "`python -m playwright install --with-deps chromium`；"
+                f"原始错误: {exc}"
+            ) from exc
         try:
             context = browser.new_context(
                 user_agent=USER_AGENT,
@@ -749,8 +772,13 @@ def check_stock() -> StockCheckResult:
         return check_stock_via_reader()
     except ApiFallbackError as exc:
         reasons.append(f"转发: {exc}")
-        log(f"转发通道不可用（{exc}），最后尝试 Playwright（无头 Chromium）...")
+        log(f"转发通道不可用（{exc}）")
 
+    if not playwright_fallback_enabled():
+        reasons.append(f"playwright: 已通过 {PLAYWRIGHT_FALLBACK_ENV} 关闭兜底")
+        raise StockCheckError("全部通道均检测失败 → " + " | ".join(reasons))
+
+    log("最后尝试 Playwright（无头 Chromium）...")
     try:
         return check_stock_via_playwright()
     except CloudflareBlockedError as exc:
